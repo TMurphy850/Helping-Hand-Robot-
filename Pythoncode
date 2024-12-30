@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""
+robot_six_ir.py
+
+Conceptual script integrating:
+ - Two-wheel balancing (MPU-6050)
+ - 12 servos (PCA9685)
+ - 6 IR sensors (HW-201): 2 in palms, 4 on body
+ - Basic camera feed
+ - (Optional) Google Coral if you want advanced AI detection
+ - Simple "close hand if palm IR sees object" logic
+"""
+
+import time
+import sys
+import cv2
+import board
+import busio
+import RPi.GPIO as GPIO
+import adafruit_pca9685
+from mpu6050 import mpu6050
+
+###################################
+# CONFIG & PIN DEFINITIONS
+###################################
+
+# Motor driver pins
+IN1, IN2, PWM_A = 5, 6, 12
+IN3, IN4, PWM_B = 13, 19, 26
+
+# PCA9685 servo frequency
+I2C_FREQ = 50
+
+# MPU-6050 I2C address
+MPU_ADDR = 0x68
+
+# IR sensors
+IR_PALM_LEFT  = 20
+IR_PALM_RIGHT = 21
+IR_BODY_1     = 16
+IR_BODY_2     = 25
+IR_BODY_3     = 8
+IR_BODY_4     = 7
+
+# We have 12 servos for 2 arms (6 each).
+# Channels 0..5 => left arm: (shoulder1, shoulder2, elbow, wrist, thumb, mitten)
+# Channels 6..11 => right arm: (shoulder1, shoulder2, elbow, wrist, thumb, mitten)
+
+# Balancing PID constants
+Kp = 40.0
+Ki = 0.0
+Kd = 0.5
+
+prev_error = 0.0
+integral = 0.0
+
+###################################
+# HELPER FUNCTIONS
+###################################
+
+def angle_to_duty(angle):
+    min_pulse = 150
+    max_pulse = 600
+    angle = max(0, min(180, angle))
+    pulse = int((angle/180)*(max_pulse - min_pulse)+min_pulse)
+    return pulse << 4  # 12-bit to 16-bit shift
+
+def set_servo(pca, channel, angle):
+    duty = angle_to_duty(angle)
+    pca.channels[channel].duty_cycle = duty
+
+def set_arm(pca, base_ch, s1, s2, el, wr, th, mt):
+    """
+    channels:
+      base_ch+0 => shoulder1
+      base_ch+1 => shoulder2
+      base_ch+2 => elbow
+      base_ch+3 => wrist
+      base_ch+4 => thumb
+      base_ch+5 => mitten
+    """
+    set_servo(pca, base_ch+0, s1)
+    set_servo(pca, base_ch+1, s2)
+    set_servo(pca, base_ch+2, el)
+    set_servo(pca, base_ch+3, wr)
+    set_servo(pca, base_ch+4, th)
+    set_servo(pca, base_ch+5, mt)
+
+########################
+# Motor Control
+########################
+
+GPIOpwmA = None
+GPIOpwmB = None
+
+def init_motors():
+    global GPIOpwmA, GPIOpwmB
+    for pin in [IN1,IN2,IN3,IN4]:
+        GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+    GPIO.setup(PWM_A, GPIO.OUT)
+    GPIO.setup(PWM_B, GPIO.OUT)
+    GPIOpwmA = GPIO.PWM(PWM_A, 1000)
+    GPIOpwmB = GPIO.PWM(PWM_B, 1000)
+    GPIOpwmA.start(0)
+    GPIOpwmB.start(0)
+
+def set_motor_speeds(left_speed, right_speed):
+    # -1..+1 range
+    if left_speed >= 0:
+        GPIO.output(IN1, GPIO.HIGH)
+        GPIO.output(IN2, GPIO.LOW)
+        dutyL = left_speed*100
+    else:
+        GPIO.output(IN1, GPIO.LOW)
+        GPIO.output(IN2, GPIO.HIGH)
+        dutyL = -left_speed*100
+    GPIOpwmA.ChangeDutyCycle(min(max(dutyL,0),100))
+
+    if right_speed>=0:
+        GPIO.output(IN3, GPIO.HIGH)
+        GPIO.output(IN4, GPIO.LOW)
+        dutyR = right_speed*100
+    else:
+        GPIO.output(IN3, GPIO.LOW)
+        GPIO.output(IN4, GPIO.HIGH)
+        dutyR = -right_speed*100
+    GPIOpwmB.ChangeDutyCycle(min(max(dutyR,0),100))
+
+########################
+# Balancing Logic
+########################
+
+def read_pitch_angle(mpu):
+    accel = mpu.get_accel_data()
+    # extremely crude approach
+    angle = -accel['x']*90
+    return angle
+
+def balance_update(mpu, dt):
+    global prev_error, integral
+    angle = read_pitch_angle(mpu)
+    error = 0.0 - angle
+    integral += error*dt
+    derivative = (error - prev_error)/dt
+    output = Kp*error + Ki*integral + Kd*derivative
+    prev_error = error
+    # clamp -1..+1
+    speed = max(min(output,1.0),-1.0)
+    set_motor_speeds(speed, speed)
+    return angle, speed
+
+########################
+# IR Sensors
+########################
+
+def init_ir_sensors():
+    for pin in [IR_PALM_LEFT, IR_PALM_RIGHT, IR_BODY_1, IR_BODY_2, IR_BODY_3, IR_BODY_4]:
+        GPIO.setup(pin, GPIO.IN)
+
+def read_ir(pin):
+    # returns 0 or 1, depending on sensor output
+    return GPIO.input(pin)
+
+########################
+# MAIN
+########################
+
+def main():
+    GPIO.setmode(GPIO.BCM)
+    init_motors()
+    init_ir_sensors()
+
+    i2c = busio.I2C(board.SCL, board.SDA)
+    pca = adafruit_pca9685.PCA9685(i2c)
+    pca.frequency = I2C_FREQ
+
+    mpu = mpu6050(MPU_ADDR)
+
+    # camera
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Camera not opened.")
+        return
+
+    # default arms = open palm
+    # left
+    left_shoulder1, left_shoulder2 = 90, 60
+    left_elbow, left_wrist = 90, 90
+    left_thumb, left_mitten = 30, 30
+    # right
+    right_shoulder1, right_shoulder2 = 90, 100
+    right_elbow, right_wrist = 90, 90
+    right_thumb, right_mitten = 30, 30
+
+    # set initial
+    set_arm(pca, 0, left_shoulder1,left_shoulder2,left_elbow,left_wrist,left_thumb,left_mitten)
+    set_arm(pca, 6, right_shoulder1,right_shoulder2,right_elbow,right_wrist,right_thumb,right_mitten)
+    time.sleep(1)
+
+    prev_time = time.time()
+
+    try:
+        while True:
+            now = time.time()
+            dt = now - prev_time
+            prev_time = now
+
+            # 1) balancing update
+            angle, speed = balance_update(mpu, dt)
+
+            # 2) read IR sensors:
+            palm_left_val = read_ir(IR_PALM_LEFT)
+            palm_right_val= read_ir(IR_PALM_RIGHT)
+            body_ir1 = read_ir(IR_BODY_1)
+            body_ir2 = read_ir(IR_BODY_2)
+            body_ir3 = read_ir(IR_BODY_3)
+            body_ir4 = read_ir(IR_BODY_4)
+
+            # simple logic: if either palm IR sees object (val=0?), then close that hand
+            if palm_left_val==0:  # left palm sees object
+                left_thumb, left_mitten = 70,70  # closed
+            else:
+                left_thumb, left_mitten = 30,30  # open
+
+            if palm_right_val==0: # right palm sees object
+                right_thumb, right_mitten=70,70
+            else:
+                right_thumb, right_mitten=30,30
+
+            # you might also check body IRs for obstacles or user presence
+            # e.g., if body_irX==0 => user is close on that side => turn motors, etc.
+
+            # update hands
+            set_servo(pca, 4, left_thumb)
+            set_servo(pca, 5, left_mitten)
+            set_servo(pca, 10, right_thumb)
+            set_servo(pca, 11, right_mitten)
+
+            # 3) camera
+            ret, frame = cap.read()
+            if ret:
+                # put angle text
+                txt = f"Angle={angle:.1f}, Speed={speed:.2f}"
+                cv2.putText(frame, txt, (10,30), cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0),2)
+                # show
+                cv2.imshow("RobotCam", frame)
+                if cv2.waitKey(1)&0xFF==ord('q'):
+                    break
+
+            time.sleep(0.02)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        pca.deinit()
+        cap.release()
+        cv2.destroyAllWindows()
+        GPIO.cleanup()
+
+if __name__=="__main__":
+    main()
